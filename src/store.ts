@@ -10,7 +10,13 @@ import { createHash } from 'node:crypto'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
-/** Monotonic on-disk schema version; a mismatch rebuilds the derived index. */
+/**
+ * On-disk schema version, written via `PRAGMA user_version` on every open.
+ * Not currently read back or compared to anything — there is no migration
+ * logic yet, since every schema change so far has been additive
+ * (`CREATE TABLE/INDEX IF NOT EXISTS`). This exists so a future breaking
+ * change has a marker to check against.
+ */
 export const SCHEMA_VERSION = 1
 
 /** One stored memory as tools and the prompt section see it. */
