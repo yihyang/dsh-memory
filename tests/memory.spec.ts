@@ -150,6 +150,15 @@ describe('secret detection', () => {
     expect(looksLikeSecret('eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U')).toBe(true)
   })
 
+  it('flags realistic (hyphenated) Anthropic/OpenAI key shapes, not just the legacy alnum-only one', () => {
+    expect(looksLikeSecret('key: sk-ant-api03-8QhX2vLpN4wRtY6zAcBd9EfGh0IjKl')).toBe(true)
+    expect(looksLikeSecret('key: sk-proj-8QhX2vLpN4wRtY6zAcBd9EfGh0IjKl')).toBe(true)
+  })
+
+  it('flags AWS temporary (STS) session tokens, not just long-term access keys', () => {
+    expect(looksLikeSecret('ASIAABCDEFGHIJKLMNOP')).toBe(true)
+  })
+
   it('leaves ordinary facts alone', () => {
     expect(looksLikeSecret('The user prefers pnpm over npm')).toBe(false)
     expect(looksLikeSecret('Release branch is called ship')).toBe(false)

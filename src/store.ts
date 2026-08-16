@@ -170,11 +170,15 @@ function hashText(text: string): string {
 // Best-effort — this is a guardrail against the common accidental paste, not a
 // secret scanner, so it stays a short, low-false-positive list.
 const SECRET_PATTERNS: readonly RegExp[] = [
-  /AKIA[0-9A-Z]{16}/, // AWS access key id
+  /\b(?:AKIA|ASIA|AIDA|AROA)[0-9A-Z]{16}\b/, // AWS access key id (long-term, STS, IAM user, role)
   /\bgh[pousr]_[A-Za-z0-9]{36,}\b/, // GitHub token (classic)
   /\bgithub_pat_[A-Za-z0-9_]{20,}\b/, // GitHub fine-grained PAT
   /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/, // Slack token
-  /\bsk-[A-Za-z0-9]{20,}\b/, // OpenAI/Anthropic-style secret key
+  // OpenAI/Anthropic-style secret key. Real keys are not pure alphanumeric —
+  // Anthropic uses `sk-ant-api03-…`, OpenAI project keys use `sk-proj-…` —
+  // so the body must allow the hyphens and underscores those shapes contain,
+  // not just the legacy `sk-<alnum>` form.
+  /\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}\b/,
   /\b(?:sk|pk)_live_[A-Za-z0-9]{10,}\b/, // Stripe live key
   /\bAIza[0-9A-Za-z_-]{35}\b/, // Google API key
   /-----BEGIN (?:RSA |EC |OPENSSH |DSA |)PRIVATE KEY-----/, // PEM private key
@@ -202,8 +206,11 @@ function restrictSiblingsToOwner(path: string): void {
   for (const suffix of ['-wal', '-shm']) {
     try {
       chmodSync(path + suffix, 0o600)
-    } catch {
-      // Not created yet.
+    } catch (error) {
+      // Only "not created yet" is expected and swallowed here — anything
+      // else (EACCES, EPERM, ...) means the hardening this function exists
+      // for actually failed, so it must surface rather than go silent.
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     }
   }
 }
@@ -253,11 +260,13 @@ export class MemoryStore {
    */
   write(text: string, tags: string, pinned: boolean): MemoryRecord {
     const now = Date.now()
-    const statement = this.#db.prepare(
-      'INSERT INTO memories (text, tags, pinned, created_at, updated_at) VALUES (?, ?, ?, ?, ?) RETURNING *')
-    const record = toRecord(statement.get(text, tags, pinned ? 1 : 0, now, now) as unknown as MemoryRow)
-    this.#audit(record.id, 'write', text, tags, pinned, now)
-    return record
+    return this.#transaction(() => {
+      const statement = this.#db.prepare(
+        'INSERT INTO memories (text, tags, pinned, created_at, updated_at) VALUES (?, ?, ?, ?, ?) RETURNING *')
+      const record = toRecord(statement.get(text, tags, pinned ? 1 : 0, now, now) as unknown as MemoryRow)
+      this.#audit(record.id, 'write', text, tags, pinned, now)
+      return record
+    })
   }
 
   /**
@@ -303,13 +312,17 @@ export class MemoryStore {
   forget(id: number): boolean {
     const row = this.#db.prepare('SELECT * FROM memories WHERE id = ?').get(id) as unknown as MemoryRow | undefined
     if (!row) return false
-    this.#db.prepare('DELETE FROM memories WHERE id = ?').run(id)
-    this.#audit(row.id, 'forget', row.text, row.tags, row.pinned !== 0, Date.now())
+    this.#transaction(() => {
+      this.#db.prepare('DELETE FROM memories WHERE id = ?').run(id)
+      this.#audit(row.id, 'forget', row.text, row.tags, row.pinned !== 0, Date.now())
+    })
     // secure_delete zeroes the row's bytes in the main file, but under WAL
     // mode a pre-delete copy still sits in the -wal file until it is
     // checkpointed. TRUNCATE both flushes it into the (now-zeroed) main file
     // and truncates the WAL back to empty, so a forgotten secret does not sit
-    // recoverable on disk for the rest of the process's lifetime.
+    // recoverable on disk for the rest of the process's lifetime. Run after
+    // the transaction commits — checkpointing mid-transaction cannot flush
+    // the frames that transaction itself is still writing.
     this.#db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
     return true
   }
@@ -332,6 +345,27 @@ export class MemoryStore {
     this.#db.prepare(
       'INSERT INTO memories_audit (memory_id, action, text_hash, tags, pinned, at) VALUES (?, ?, ?, ?, ?, ?)')
       .run(memoryId, action, hashText(text), tags, pinned ? 1 : 0, at)
+  }
+
+  /**
+   * Run `fn` inside an explicit transaction, so a mutation and its audit row
+   * commit or fail together. Without this, a mid-air failure (disk full,
+   * corruption) between the two statements could leave the live table
+   * mutated with no audit entry, or vice versa — exactly the failure the
+   * audit trail exists to help diagnose.
+   * @param fn - the statements to run atomically.
+   * @returns whatever `fn` returns.
+   */
+  #transaction<T>(fn: () => T): T {
+    this.#db.exec('BEGIN')
+    try {
+      const result = fn()
+      this.#db.exec('COMMIT')
+      return result
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
   }
 
   /**
