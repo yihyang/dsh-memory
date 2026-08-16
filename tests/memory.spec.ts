@@ -1,8 +1,9 @@
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { MemoryStore, compileMatch, normalizeTags } from '../src/store.ts'
+import { MemoryStore, compileMatch, looksLikeSecret, normalizeTags } from '../src/store.ts'
 
 /**
  * Behavior suite for the memory store: FTS retrieval, the literal-token query
@@ -136,6 +137,82 @@ describe('forget', () => {
   it('reports a miss rather than throwing', () => {
     const store = new MemoryStore(':memory:')
     expect(store.forget(9999)).toBe(false)
+    store.close()
+  })
+})
+
+describe('secret detection', () => {
+  it('flags common credential shapes', () => {
+    expect(looksLikeSecret('AWS key AKIAABCDEFGHIJKLMNOP in the deploy script')).toBe(true)
+    expect(looksLikeSecret('token: ghp_abcdefghijklmnopqrstuvwxyz0123456789')).toBe(true)
+    expect(looksLikeSecret('sk-abcdefghijklmnopqrstuvwx')).toBe(true)
+    expect(looksLikeSecret('-----BEGIN RSA PRIVATE KEY-----\nMIIB...')).toBe(true)
+    expect(looksLikeSecret('eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U')).toBe(true)
+  })
+
+  it('flags realistic (hyphenated) Anthropic/OpenAI key shapes, not just the legacy alnum-only one', () => {
+    expect(looksLikeSecret('key: sk-ant-api03-8QhX2vLpN4wRtY6zAcBd9EfGh0IjKl')).toBe(true)
+    expect(looksLikeSecret('key: sk-proj-8QhX2vLpN4wRtY6zAcBd9EfGh0IjKl')).toBe(true)
+  })
+
+  it('flags AWS temporary (STS) session tokens, not just long-term access keys', () => {
+    expect(looksLikeSecret('ASIAABCDEFGHIJKLMNOP')).toBe(true)
+  })
+
+  it('leaves ordinary facts alone', () => {
+    expect(looksLikeSecret('The user prefers pnpm over npm')).toBe(false)
+    expect(looksLikeSecret('Release branch is called ship')).toBe(false)
+  })
+})
+
+describe('audit trail', () => {
+  it('records a write without persisting the raw text', () => {
+    const store = new MemoryStore(':memory:')
+    const record = store.write('a durable fact', 'build', false)
+
+    const log = store.auditLog(10)
+    expect(log).toHaveLength(1)
+    expect(log[0]).toMatchObject({ memoryId: record.id, action: 'write', tags: 'build', pinned: false })
+    expect(log[0]?.textHash).not.toContain('a durable fact')
+    expect(log[0]?.textHash).toMatch(/^[0-9a-f]{64}$/)
+    store.close()
+  })
+
+  it('records a forget only when a record actually existed', () => {
+    const store = new MemoryStore(':memory:')
+    const record = store.write('temporary', '', false)
+
+    expect(store.forget(9999)).toBe(false)
+    expect(store.forget(record.id)).toBe(true)
+
+    const log = store.auditLog(10)
+    expect(log.map(entry => entry.action)).toEqual(['forget', 'write'])
+    store.close()
+  })
+})
+
+describe('forgetting scrubs the WAL, not just the main file', () => {
+  it('leaves no recoverable trace in the -wal file after forget, while the connection is still open', async () => {
+    const { store, path } = await fileStore()
+    const marker = 'UNIQUE-MARKER-do-not-leak-01234567890123456789'
+    const record = store.write(marker, '', false)
+    store.forget(record.id)
+
+    for (const file of [path, `${path}-wal`, `${path}-shm`]) {
+      if (!existsSync(file)) continue
+      expect(readFileSync(file).includes(marker)).toBe(false)
+    }
+    store.close()
+  })
+})
+
+describe('file permissions', () => {
+  it('restricts the database file and its directory to the owner', async () => {
+    const { store, path } = await fileStore()
+    store.write('anything', '', false)
+
+    expect(statSync(path).mode & 0o777).toBe(0o600)
+    expect(statSync(dirname(path)).mode & 0o777).toBe(0o700)
     store.close()
   })
 })

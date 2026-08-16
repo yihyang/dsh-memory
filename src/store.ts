@@ -5,11 +5,18 @@
  * @module dsh-memory/store
  */
 
-import { mkdirSync } from 'node:fs'
+import { chmodSync, mkdirSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
-/** Monotonic on-disk schema version; a mismatch rebuilds the derived index. */
+/**
+ * On-disk schema version, written via `PRAGMA user_version` on every open.
+ * Not currently read back or compared to anything — there is no migration
+ * logic yet, since every schema change so far has been additive
+ * (`CREATE TABLE/INDEX IF NOT EXISTS`). This exists so a future breaking
+ * change has a marker to check against.
+ */
 export const SCHEMA_VERSION = 1
 
 /** One stored memory as tools and the prompt section see it. */
@@ -29,6 +36,25 @@ export interface MemoryMatch extends MemoryRecord {
   rank: number
 }
 
+/** One append-only audit row: what happened to a memory, not its content. */
+export interface AuditEntry {
+  id: number
+  memoryId: number
+  action: 'write' | 'forget'
+  /**
+   * SHA-256 hex of the memory text at the time of the action — never the text
+   * itself. This is a correlation/integrity token, not a confidentiality
+   * boundary: memory text is short natural language, not high-entropy
+   * secret material, so an investigator (or anyone who can read this table)
+   * with a list of candidate strings can confirm which ones were stored by
+   * hashing each candidate and comparing.
+   */
+  textHash: string
+  tags: string
+  pinned: boolean
+  at: number
+}
+
 /** Row shape returned by the statements below, before field-name and boolean normalization. */
 interface MemoryRow {
   id: number
@@ -38,6 +64,17 @@ interface MemoryRow {
   created_at: number
   updated_at: number
   rank?: number
+}
+
+/** Row shape for `memories_audit`, before field-name and boolean normalization. */
+interface AuditRow {
+  id: number
+  memory_id: number
+  action: string
+  text_hash: string
+  tags: string
+  pinned: number
+  at: number
 }
 
 const SCHEMA = `
@@ -62,6 +99,16 @@ const SCHEMA = `
     INSERT INTO memories_fts (memories_fts, rowid, text, tags) VALUES ('delete', old.id, old.text, old.tags);
     INSERT INTO memories_fts (rowid, text, tags) VALUES (new.id, new.text, new.tags);
   END;
+  CREATE TABLE IF NOT EXISTS memories_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_id INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    text_hash TEXT NOT NULL,
+    tags TEXT NOT NULL DEFAULT '',
+    pinned INTEGER NOT NULL DEFAULT 0,
+    at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS memories_audit_memory_id ON memories_audit (memory_id, at);
 `
 
 /**
@@ -107,6 +154,73 @@ function toRecord(row: MemoryRow): MemoryRecord {
   }
 }
 
+/** Map one row to the audit entry shape, converting SQLite's integer boolean. */
+function toAuditEntry(row: AuditRow): AuditEntry {
+  return {
+    id: row.id,
+    memoryId: row.memory_id,
+    action: row.action as AuditEntry['action'],
+    textHash: row.text_hash,
+    tags: row.tags,
+    pinned: row.pinned !== 0,
+    at: row.at,
+  }
+}
+
+/** SHA-256 hex digest of a memory's text, for the audit trail — never the text itself. */
+function hashText(text: string): string {
+  return createHash('sha256').update(text, 'utf8').digest('hex')
+}
+
+// Common credential shapes: cloud/VCS/chat tokens, PEM private keys, JWTs.
+// Best-effort — this is a guardrail against the common accidental paste, not a
+// secret scanner, so it stays a short, low-false-positive list.
+const SECRET_PATTERNS: readonly RegExp[] = [
+  /\b(?:AKIA|ASIA|AIDA|AROA)[0-9A-Z]{16}\b/, // AWS access key id (long-term, STS, IAM user, role)
+  /\bgh[pousr]_[A-Za-z0-9]{36,}\b/, // GitHub token (classic)
+  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/, // GitHub fine-grained PAT
+  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/, // Slack token
+  // OpenAI/Anthropic-style secret key. Real keys are not pure alphanumeric —
+  // Anthropic uses `sk-ant-api03-…`, OpenAI project keys use `sk-proj-…` —
+  // so the body must allow the hyphens and underscores those shapes contain,
+  // not just the legacy `sk-<alnum>` form.
+  /\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}\b/,
+  /\b(?:sk|pk)_live_[A-Za-z0-9]{10,}\b/, // Stripe live key
+  /\bAIza[0-9A-Za-z_-]{35}\b/, // Google API key
+  /-----BEGIN (?:RSA |EC |OPENSSH |DSA |)PRIVATE KEY-----/, // PEM private key
+  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/, // JWT
+]
+
+/**
+ * Whether text contains a recognizable credential shape (cloud/VCS/chat
+ * token, PEM private key, JWT). A guardrail against the common accidental
+ * paste, not a guarantee of catching every secret.
+ * @param text - the candidate memory text.
+ * @returns true when a known secret shape is found.
+ */
+export function looksLikeSecret(text: string): boolean {
+  return SECRET_PATTERNS.some(pattern => pattern.test(text))
+}
+
+/**
+ * Restrict the WAL/SHM siblings created lazily by `journal_mode=WAL` to the
+ * owning user. Best-effort: called once they are expected to exist, but a
+ * driver that defers their creation further could still race this.
+ * @param path - the database file path.
+ */
+function restrictSiblingsToOwner(path: string): void {
+  for (const suffix of ['-wal', '-shm']) {
+    try {
+      chmodSync(path + suffix, 0o600)
+    } catch (error) {
+      // Only "not created yet" is expected and swallowed here — anything
+      // else (EACCES, EPERM, ...) means the hardening this function exists
+      // for actually failed, so it must surface rather than go silent.
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+  }
+}
+
 /**
  * The durable memory store. One instance owns one SQLite connection; `close()`
  * is idempotent and runs from the plugin's disposer.
@@ -120,12 +234,27 @@ export class MemoryStore {
    * @param path - database file path, or `:memory:` for an ephemeral store.
    */
   constructor(path: string) {
-    if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true })
+    // Lock the directory down *before* the file exists in it, and the file
+    // immediately after creation — before schema or pragma writes touch it —
+    // so there is no window where the store holds real content at a
+    // world/group-readable path or mode.
+    if (path !== ':memory:') {
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
+      chmodSync(dirname(path), 0o700)
+    }
     this.#db = new DatabaseSync(path)
+    if (path !== ':memory:') chmodSync(path, 0o600)
     this.#db.exec('PRAGMA journal_mode = WAL')
     this.#db.exec('PRAGMA foreign_keys = ON')
+    // Overwrite deleted rows' bytes on disk instead of leaving them in freed
+    // pages, so memory_forget on a mistakenly-stored secret actually scrubs it.
+    // secure_delete only covers the main file, though — forget() below also
+    // checkpoints and truncates the WAL, which otherwise retains a pre-delete
+    // copy of the row until the connection closes.
+    this.#db.exec('PRAGMA secure_delete = ON')
     this.#db.exec(SCHEMA)
     this.#db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
+    if (path !== ':memory:') restrictSiblingsToOwner(path)
   }
 
   /**
@@ -137,9 +266,13 @@ export class MemoryStore {
    */
   write(text: string, tags: string, pinned: boolean): MemoryRecord {
     const now = Date.now()
-    const statement = this.#db.prepare(
-      'INSERT INTO memories (text, tags, pinned, created_at, updated_at) VALUES (?, ?, ?, ?, ?) RETURNING *')
-    return toRecord(statement.get(text, tags, pinned ? 1 : 0, now, now) as unknown as MemoryRow)
+    return this.#transaction(() => {
+      const statement = this.#db.prepare(
+        'INSERT INTO memories (text, tags, pinned, created_at, updated_at) VALUES (?, ?, ?, ?, ?) RETURNING *')
+      const record = toRecord(statement.get(text, tags, pinned ? 1 : 0, now, now) as unknown as MemoryRow)
+      this.#audit(record.id, 'write', text, tags, pinned, now)
+      return record
+    })
   }
 
   /**
@@ -183,7 +316,62 @@ export class MemoryStore {
    * @returns whether a record was deleted.
    */
   forget(id: number): boolean {
-    return this.#db.prepare('DELETE FROM memories WHERE id = ?').run(id).changes > 0
+    const row = this.#db.prepare('SELECT * FROM memories WHERE id = ?').get(id) as unknown as MemoryRow | undefined
+    if (!row) return false
+    this.#transaction(() => {
+      this.#db.prepare('DELETE FROM memories WHERE id = ?').run(id)
+      this.#audit(row.id, 'forget', row.text, row.tags, row.pinned !== 0, Date.now())
+    })
+    // secure_delete zeroes the row's bytes in the main file, but under WAL
+    // mode a pre-delete copy still sits in the -wal file until it is
+    // checkpointed. TRUNCATE both flushes it into the (now-zeroed) main file
+    // and truncates the WAL back to empty, so a forgotten secret does not sit
+    // recoverable on disk for the rest of the process's lifetime. Run after
+    // the transaction commits — checkpointing mid-transaction cannot flush
+    // the frames that transaction itself is still writing.
+    this.#db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+    return true
+  }
+
+  /**
+   * The append-only history of writes and forgets, most recent first. Text is
+   * never stored — only its hash — so the trail can confirm what happened
+   * without duplicating the risk it exists to help investigate.
+   * @param limit - maximum entries to return.
+   * @returns the audit entries.
+   */
+  auditLog(limit: number): AuditEntry[] {
+    const rows = this.#db.prepare(
+      'SELECT * FROM memories_audit ORDER BY at DESC, id DESC LIMIT ?').all(limit) as unknown as AuditRow[]
+    return rows.map(toAuditEntry)
+  }
+
+  /** Append one audit row. Never persists the memory text — only its hash. */
+  #audit(memoryId: number, action: AuditEntry['action'], text: string, tags: string, pinned: boolean, at: number): void {
+    this.#db.prepare(
+      'INSERT INTO memories_audit (memory_id, action, text_hash, tags, pinned, at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(memoryId, action, hashText(text), tags, pinned ? 1 : 0, at)
+  }
+
+  /**
+   * Run `fn` inside an explicit transaction, so a mutation and its audit row
+   * commit or fail together. Without this, a mid-air failure (disk full,
+   * corruption) between the two statements could leave the live table
+   * mutated with no audit entry, or vice versa — exactly the failure the
+   * audit trail exists to help diagnose.
+   * @param fn - the statements to run atomically.
+   * @returns whatever `fn` returns.
+   */
+  #transaction<T>(fn: () => T): T {
+    this.#db.exec('BEGIN')
+    try {
+      const result = fn()
+      this.#db.exec('COMMIT')
+      return result
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
   }
 
   /**
